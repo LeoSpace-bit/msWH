@@ -1,3 +1,4 @@
+#models.py
 from datetime import datetime
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import CheckConstraint, UniqueConstraint
@@ -16,14 +17,22 @@ class LegalEntity(db.Model):
 class StorageLocation(db.Model):
     __tablename__ = 'storage_locations'
     id = db.Column(db.Integer, primary_key=True)
-    zone = db.Column(db.String(16), nullable=False)
-    cell = db.Column(db.String(16), nullable=False)
+    zone = db.Column(db.String(50), nullable=False)
+    capacity = db.Column(db.Integer, nullable=False)
+    cells = db.relationship('StorageCell', back_populates='zone')
+    # Добавляем отсутствующее отношение
     stock_items = db.relationship('StockItem', back_populates='location')
 
-    __table_args__ = (
-        UniqueConstraint('zone', 'cell', name='uq_zone_cell'),
-    )
+class StorageCell(db.Model):
+    __tablename__ = 'storage_cells'
+    id = db.Column(db.Integer, primary_key=True)
+    zone_id = db.Column(db.Integer, db.ForeignKey('storage_locations.id'), nullable=False)
+    cell_number = db.Column(db.Integer, nullable=False)
+    pgd_id = db.Column(db.Integer, db.ForeignKey('stock_items.id'), nullable=True)
 
+    # Отношения
+    zone = db.relationship('StorageLocation', back_populates='cells')
+    stock_item = db.relationship('StockItem', backref='cells')
 
 class StockItem(db.Model):
     __tablename__ = 'stock_items'
@@ -35,6 +44,7 @@ class StockItem(db.Model):
 
     __table_args__ = (
         CheckConstraint('quantity > 0', name='quantity_positive'),
+        {'extend_existing': True}  # Теперь это ключевые аргументы
     )
 
 
@@ -64,7 +74,7 @@ class InvoiceItem(db.Model):
     stock_item_id = db.Column(db.Integer, db.ForeignKey('stock_items.id'), nullable=False)
 
     invoice = db.relationship('Invoice', back_populates='items')
-    stock_item = db.relationship('StockItem')
+    stock_item = db.relationship('StockItem', backref='invoice_items')
 
     __table_args__ = (
         CheckConstraint('quantity > 0', name='item_quantity_positive'),

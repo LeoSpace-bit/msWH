@@ -1,15 +1,16 @@
 #config.py
 import os
+import sys
+
 
 class Config:
+    # Warehouse Settings
+    DEFAULT_STOCK_ITEM_ID = 2**31 - 1
+    RECIPIENT_WAREHOUSE = 'WHAAAAAARUS060ru00000002'
+
     # Database
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'your-secret-key'
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///local_wh.db'
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
-    SQLALCHEMY_ECHO = True
-
-    # Warehouse Settings
-    RECIPIENT_WAREHOUSE = 'WHAAAAAARUS060ru00000002'
+    SQLALCHEMY_DATABASE_URI = "sqlite:///storage_wh.db"
 
     # Zone Settings
     ZONE_SETTINGS = {

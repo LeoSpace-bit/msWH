@@ -1,83 +1,87 @@
-#models.py
+from sqlalchemy import Column, Integer, String, Enum, ForeignKey, CheckConstraint, Date, DateTime, PrimaryKeyConstraint
+from sqlalchemy.orm import relationship
+from sqlalchemy.ext.declarative import declarative_base
+from enum import Enum as PyEnum
 from datetime import datetime
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import CheckConstraint, UniqueConstraint
+from config import Config
 
-db = SQLAlchemy()
-
-
-class LegalEntity(db.Model):
-    __tablename__ = 'legal_entities'
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    address = db.Column(db.String(200))
-    tax_id = db.Column(db.String(20), unique=True)  # ИНН
+Base = declarative_base()
 
 
-class StorageLocation(db.Model):
+class InvoiceType(PyEnum):
+    ARRIVAL = 'arrival'
+    DEPARTURE = 'departure'
+    WRITE_OFF = 'write-off'
+
+
+class InvoiceStatus(PyEnum):
+    REJECTED = 'rejected'
+    ERROR = 'error'
+    COMPLETED = 'completed'
+    CREATED = 'created'
+    SHIPPING = 'shipping'
+    RECEIVED = 'received'
+
+
+class StorageLocation(Base):
     __tablename__ = 'storage_locations'
-    id = db.Column(db.Integer, primary_key=True)
-    zone = db.Column(db.String(50), nullable=False)
-    capacity = db.Column(db.Integer, nullable=False)
-    cells = db.relationship('StorageCell', back_populates='zone')
-    # Добавляем отсутствующее отношение
-    stock_items = db.relationship('StockItem', back_populates='location')
 
-class StorageCell(db.Model):
-    __tablename__ = 'storage_cells'
-    id = db.Column(db.Integer, primary_key=True)
-    zone_id = db.Column(db.Integer, db.ForeignKey('storage_locations.id'), nullable=False)
-    cell_number = db.Column(db.Integer, nullable=False)
-    pgd_id = db.Column(db.Integer, db.ForeignKey('stock_items.id'), nullable=True)
+    id = Column(Integer, primary_key=True)
+    sector_name = Column(String(50), unique=True, nullable=False)
+    capacity = Column(Integer, CheckConstraint('capacity > 0'), nullable=False)
 
-    # Отношения
-    zone = db.relationship('StorageLocation', back_populates='cells')
-    stock_item = db.relationship('StockItem', backref='cells')
+    allocations = relationship("StockAllocation", back_populates="location")
 
-class StockItem(db.Model):
+
+class StockAllocation(Base):
+    __tablename__ = 'stock_allocations'
+    __table_args__ = (
+        PrimaryKeyConstraint('storage_location_id', 'cell_id'),
+        CheckConstraint('cell_id > 0')
+    )
+
+    storage_location_id = Column(Integer, ForeignKey('storage_locations.id'))
+    cell_id = Column(Integer)
+    stock_item_id = Column(Integer, ForeignKey('stock_items.pgd_id'), nullable=False)
+
+    location = relationship("StorageLocation", back_populates="allocations")
+    stock_item = relationship("StockItem", back_populates="allocations")
+
+
+class StockItem(Base):
     __tablename__ = 'stock_items'
-    id = db.Column(db.Integer, primary_key=True)
-    pgd_id = db.Column(db.Integer, unique=True, nullable=False)
-    quantity = db.Column(db.Integer, nullable=False)
-    location_id = db.Column(db.Integer, db.ForeignKey('storage_locations.id'), nullable=False)
-    location = db.relationship('StorageLocation', back_populates='stock_items')
 
-    __table_args__ = (
-        CheckConstraint('quantity > 0', name='quantity_positive'),
-        {'extend_existing': True}  # Теперь это ключевые аргументы
-    )
+    pgd_id = Column(Integer, primary_key=True)
+    quantity = Column(Integer, CheckConstraint('quantity >= 0'), nullable=False)
+
+    allocations = relationship("StockAllocation", back_populates="stock_item")
 
 
-class Invoice(db.Model):
+class Invoice(Base):
     __tablename__ = 'invoices'
-    id = db.Column(db.Integer, primary_key=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow())
-    invoice_type = db.Column(db.Enum('arrival', 'departure', 'write-off', name='invoice_type'), nullable=False)
-    status = db.Column(db.Enum('rejected', 'error', 'completed', 'created', 'shipping', 'received', name='invoice_status'), nullable=False)
-    recipient_warehouse = db.Column(db.String(24), nullable=False)
-    items = db.relationship('InvoiceItem', back_populates='invoice')
-    shipper_id = db.Column(db.Integer, db.ForeignKey('legal_entities.id'), nullable=False)
-    consignee_id = db.Column(db.Integer, db.ForeignKey('legal_entities.id'))
 
-    shipper = db.relationship('LegalEntity', foreign_keys=[shipper_id], backref='shipped_invoices')
-    consignee = db.relationship('LegalEntity', foreign_keys=[consignee_id], backref='received_invoices')
+    id = Column(Integer, primary_key=True)
+    invoice_type = Column(Enum(InvoiceType), nullable=False)
+    status = Column(Enum(InvoiceStatus), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    sender_warehouse = Column(String(24))
+    receiver_warehouse = Column(String(24))
+
+    items = relationship("InvoiceItem", back_populates="invoice")
 
 
-class InvoiceItem(db.Model):
+class InvoiceItem(Base):
     __tablename__ = 'invoice_items'
-    id = db.Column(db.Integer, primary_key=True)
-    production_date = db.Column(db.Date)
-    expiration_date = db.Column(db.Date)
-    quantity = db.Column(db.Integer, nullable=False)
-    batch_number = db.Column(db.String(50), nullable=False)
-    invoice_id = db.Column(db.Integer, db.ForeignKey('invoices.id'), nullable=False)
-    stock_item_id = db.Column(db.Integer, db.ForeignKey('stock_items.id'), nullable=False)
-
-    invoice = db.relationship('Invoice', back_populates='items')
-    stock_item = db.relationship('StockItem', backref='invoice_items')
-
     __table_args__ = (
-        CheckConstraint('quantity > 0', name='item_quantity_positive'),
-        CheckConstraint('expiration_date >= production_date', name='valid_expiration'),
-        UniqueConstraint('stock_item_id', 'batch_number', name='unique_batch_per_item'),
+        PrimaryKeyConstraint('invoice_id', 'pgd_id'),
     )
+
+    invoice_id = Column(Integer, ForeignKey('invoices.id'))
+    pgd_id = Column(Integer, ForeignKey('stock_items.pgd_id'))
+    quantity = Column(Integer, CheckConstraint('quantity > 0'), nullable=False)
+    batch_number = Column(String(50))
+    production_date = Column(Date)
+    expiration_date = Column(Date)
+
+    invoice = relationship("Invoice", back_populates="items")
+    stock_item = relationship("StockItem")

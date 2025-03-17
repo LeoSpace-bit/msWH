@@ -1,4 +1,2 @@
-Flask~=3.1.0
-Flask-SQLAlchemy
-Flask-Migrate~=4.1.0
 SQLAlchemy~=2.0.38
+alembic~=1.15.1

@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 import random
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import and_
 
 from models import Invoice, InvoiceItem, StorageLocation, StockItem, StockAllocation
 from config import Config
@@ -33,9 +34,10 @@ class LogisticsService:
             # Проверяем каждую зону на наличие достаточного места
             suitable_zones = []
             for zone in zones:
-                # Количество занятых ячеек в зоне
-                used_cells = session.query(StockAllocation).filter_by(
-                    storage_location_id=zone.id
+                # Количество ЗАНЯТЫХ ячеек (исключая пустые)
+                used_cells = session.query(StockAllocation).filter(
+                    StockAllocation.storage_location_id == zone.id,
+                    StockAllocation.stock_item_id != Config.DEFAULT_STOCK_ITEM_ID
                 ).count()
 
                 available = zone.capacity - used_cells
@@ -44,8 +46,7 @@ class LogisticsService:
 
             if not suitable_zones:
                 raise ValueError(
-                    f"Недостаточно свободных ячеек. "
-                    f"Требуется: {total_quantity}, "
+                    f"Недостаточно свободных ячеек. Требуется: {total_quantity}, "
                     f"доступно в зонах: {[z.sector_name for z in zones]}"
                 )
         finally:
@@ -134,6 +135,87 @@ class LogisticsService:
             session.rollback()
             raise e
 
+    def create_departure_invoice(self, items: list[tuple[int, int]],
+                                 sender_warehouse: str,
+                                 receiver_warehouse: str):
+        """
+        Создание накладной на отгрузку товаров
+        """
+        # 1. Валидация складов
+        if len(sender_warehouse) != 24 or len(receiver_warehouse) != 24:
+            raise ValueError("Названия складов должны быть 24 символа")
+
+        if sender_warehouse == receiver_warehouse:
+            raise ValueError("Склады отправителя и получателя не могут совпадать")
+
+        session = self.Session()
+        try:
+            # 2. Проверка наличия товаров
+            status = InvoiceStatus.CREATED
+            for pgd_id, qty in items:
+                stock_item = session.query(StockItem).filter_by(pgd_id=pgd_id).first()
+                if not stock_item or stock_item.quantity < qty:
+                    status = InvoiceStatus.REJECTED
+                    break
+
+            # Создаем накладную
+            new_invoice = Invoice(
+                invoice_type=InvoiceType.DEPARTURE,
+                status=status,
+                created_at=datetime.utcnow(),
+                sender_warehouse=sender_warehouse,
+                receiver_warehouse=receiver_warehouse
+            )
+            session.add(new_invoice)
+            session.flush()
+
+            if status == InvoiceStatus.REJECTED:
+                session.commit()
+                return new_invoice
+
+            # 3. Создание элементов накладной
+            invoice_items = []
+            for pgd_id, qty in items:
+                invoice_items.append(InvoiceItem(
+                    invoice_id=new_invoice.id,
+                    pgd_id=pgd_id,
+                    quantity=qty,
+                    batch_number=self.generate_batch_number(),
+                    production_date=datetime.utcnow() - timedelta(days=1),
+                    expiration_date=datetime.utcnow() + timedelta(days=365)
+                ))
+
+            session.add_all(invoice_items)
+            session.flush()
+
+            # 4. Освобождение ячеек
+            for pgd_id, qty in items:
+                # Находим первые N ячеек с товаром
+                cells = session.query(StockAllocation).filter(
+                    StockAllocation.stock_item_id == pgd_id
+                ).limit(qty).all()
+
+                # Помечаем ячейки как свободные
+                for cell in cells:
+                    cell.stock_item_id = Config.DEFAULT_STOCK_ITEM_ID
+
+                # Обновляем StockItem
+                stock_item = session.query(StockItem).filter_by(pgd_id=pgd_id).first()
+                stock_item.quantity -= qty
+
+            # 5. Финализация статуса
+            new_invoice.status = InvoiceStatus.SHIPPING
+            session.commit()
+            return new_invoice
+
+        except Exception as e:
+            session.rollback()
+            new_invoice.status = InvoiceStatus.ERROR
+            session.commit()
+            raise e
+        finally:
+            session.close()
+
 
 class BatchScanner:
     """Симулятор сканера штрих-кодов"""
@@ -163,6 +245,30 @@ class ScannersQueue:
         self.Session = sessionmaker(bind=self.engine)
         self.retry_registry = defaultdict(int)
         self.scanner = BatchScanner()
+
+    def process_departure(self, invoice_id: int):
+        """
+        Обработка отгрузки товаров (для использования в других процессах)
+        """
+        session = self.Session()
+        try:
+            invoice = session.query(Invoice).get(invoice_id)
+            if not invoice or invoice.status != InvoiceStatus.SHIPPING:
+                return
+
+            # Дополнительные проверки и логика доставки
+            # ...
+
+            invoice.status = InvoiceStatus.COMPLETED
+            session.commit()
+
+        except Exception as e:
+            session.rollback()
+            invoice.status = InvoiceStatus.ERROR
+            session.commit()
+            raise e
+        finally:
+            session.close()
 
     def process_pending_invoices(self, warehouse_id: str) -> dict:
         """
@@ -276,5 +382,119 @@ class ScannersQueue:
             "status": "error",
             "message": f"Системная ошибка: {str(error)}"
         }
+
+
+def check_delivery():
+    """Обработка полученных поставок и распределение товаров по ячейкам"""
+    engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        # Находим подходящие накладные
+        invoices = session.query(Invoice).filter(
+            Invoice.invoice_type == InvoiceType.ARRIVAL,
+            Invoice.status == InvoiceStatus.RECEIVED,
+            Invoice.receiver_warehouse == Config.RECIPIENT_WAREHOUSE
+        ).all()
+
+        for invoice in invoices:
+            success = True
+            items_to_update = {}
+
+            try:
+                # Обрабатываем каждый товар в накладной
+                for item in invoice.items:
+                    pgd_id = item.pgd_id
+                    quantity = item.quantity
+
+                    # Находим подходящую зону для товара
+                    zone = _find_suitable_zone(session, pgd_id, quantity)
+                    if not zone:
+                        success = False
+                        break
+
+                    # Находим свободные ячейки в зоне
+                    free_cells = session.query(StockAllocation).filter(
+                        StockAllocation.storage_location_id == zone.id,
+                        StockAllocation.stock_item_id == Config.DEFAULT_STOCK_ITEM_ID
+                    ).limit(quantity).all()
+
+                    if len(free_cells) < quantity:
+                        success = False
+                        break
+
+                    # Занимаем ячейки
+                    for cell in free_cells[:quantity]:
+                        cell.stock_item_id = pgd_id
+
+                    # Сохраняем количество для обновления StockItem
+                    items_to_update[pgd_id] = items_to_update.get(pgd_id, 0) + quantity
+
+                if success:
+                    # Обновляем StockItems и статус накладной
+                    _update_stock_items(session, items_to_update)
+                    invoice.status = InvoiceStatus.COMPLETED
+                else:
+                    invoice.status = InvoiceStatus.ERROR
+
+                session.commit()
+                print(f"Накладная {invoice.id} обработана: {invoice.status}")
+
+            except Exception as e:
+                session.rollback()
+                invoice.status = InvoiceStatus.ERROR
+                session.commit()
+                print(f"Ошибка обработки накладной {invoice.id}: {str(e)}")
+
+        return {"processed_invoices": len(invoices)}
+
+    except SQLAlchemyError as e:
+        session.rollback()
+        print(f"Ошибка базы данных: {str(e)}")
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+def _find_suitable_zone(session, pgd_id: int, required_cells: int) -> StorageLocation:
+    """Находит зону с достаточным количеством свободных ячеек для товара"""
+    # Проверяем существующие зоны с товаром
+    existing_zone = session.query(StockAllocation.storage_location_id).filter(
+        StockAllocation.stock_item_id == pgd_id
+    ).first()
+
+    if existing_zone:
+        # Проверяем доступность места в текущей зоне
+        free_in_zone = session.query(StockAllocation).filter(
+            StockAllocation.storage_location_id == existing_zone.storage_location_id,
+            StockAllocation.stock_item_id == Config.DEFAULT_STOCK_ITEM_ID
+        ).count()
+
+        if free_in_zone >= required_cells:
+            return session.get(StorageLocation, existing_zone.storage_location_id)
+
+    # Ищем новую подходящую зону
+    zones = session.query(StorageLocation).all()
+    for zone in zones:
+        free_cells = session.query(StockAllocation).filter(
+            StockAllocation.storage_location_id == zone.id,
+            StockAllocation.stock_item_id == Config.DEFAULT_STOCK_ITEM_ID
+        ).count()
+
+        if free_cells >= required_cells:
+            return zone
+
+    return None
+
+
+def _update_stock_items(session, items_to_update: dict):
+    """Обновляет количество товаров в StockItem"""
+    for pgd_id, quantity in items_to_update.items():
+        stock_item = session.query(StockItem).filter_by(pgd_id=pgd_id).first()
+        if stock_item:
+            stock_item.quantity += quantity
+        else:
+            session.add(StockItem(pgd_id=pgd_id, quantity=quantity))
 
 

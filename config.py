@@ -1,12 +1,10 @@
 #config.py
 import os
-import sys
-
 
 class Config:
     # Warehouse Settings
-    DEFAULT_STOCK_ITEM_ID = 2**31 - 1
-    RECIPIENT_WAREHOUSE = 'WHAAAAAARUS060ru00000002'
+    DEFAULT_STOCK_ITEM_ID = 0
+    RECIPIENT_WAREHOUSE = 'WHAAAAAARUS060ru00000002' # личный уникальный номер
 
     # Database
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'your-secret-key'
@@ -32,10 +30,6 @@ class Config:
         }
     }
 
-    # Kafka
-    KAFKA_BROKERS = os.getenv('KAFKA_BROKERS', 'localhost:9092').split(',')
-    KAFKA_GROUP_ID = os.getenv('KAFKA_GROUP_ID', 'warehouse-group')
-
-    # Safety
-    MAX_RETRIES = 3
-    RETRY_DELAY = 5  # seconds
+    # В config.py WH добавить:
+    KAFKA_BOOTSTRAP_SERVERS = 'localhost:29092'
+    KAFKA_STOCK_TOPIC = 'warehouse_stock_updates'

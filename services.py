@@ -1,8 +1,14 @@
 #services.py
 from datetime import datetime, timedelta
 import random
+
+import logger
+from kafka.errors import NoBrokersAvailable
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import and_
+from kafka import KafkaProducer, KafkaConsumer
+import json
+import threading
+import logging
 
 from models import Invoice, InvoiceItem, StorageLocation, StockItem, StockAllocation
 from config import Config
@@ -382,6 +388,118 @@ class ScannersQueue:
             "status": "error",
             "message": f"Системная ошибка: {str(error)}"
         }
+
+
+class StockMonitor:
+    def __init__(self):
+        self.engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)
+        self.Session = sessionmaker(bind=self.engine)
+        self.logger = logging.getLogger('StockMonitor')
+        self.logger.setLevel(logging.INFO)
+
+        try:
+            self.producer = KafkaProducer(
+                bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS.split(','),
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                retries=5,
+                acks='all'
+            )
+            self.logger.info("Kafka producer initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Kafka producer: {str(e)}")
+            raise
+
+        self.running = True
+
+    def start_monitoring(self):
+        def monitor_loop():
+            self.logger.info("Starting stock monitoring service")
+            while self.running:
+                session = None
+                try:
+                    session = self.Session()
+                    # Получаем актуальные данные из БД
+                    stock_items = session.query(StockItem).filter(StockItem.quantity > 0).all()
+                    self.logger.debug(f"Found {len(stock_items)} stock items in DB")
+
+                    if not stock_items:
+                        self.logger.warning("No stock items found in database")
+                        continue
+
+                    # Формируем сообщение
+                    stock_data = {
+                        Config.RECIPIENT_WAREHOUSE: [
+                            {
+                                "pgd_id": item.pgd_id,
+                                "quantity": item.quantity,
+                                "timestamp": datetime.utcnow().isoformat()
+                            } for item in stock_items
+                        ]
+                    }
+
+                    # Отправляем сообщение
+                    future = self.producer.send(
+                        Config.KAFKA_STOCK_TOPIC,
+                        value=stock_data
+                    )
+                    # Ожидаем подтверждения
+                    future.get(timeout=10)
+                    self.logger.info(f"Successfully sent stock update for warehouse {Config.RECIPIENT_WAREHOUSE}")
+
+                except NoBrokersAvailable as e:
+                    self.logger.error(f"Kafka brokers not available: {str(e)}")
+                except Exception as e:
+                    self.logger.error(f"Monitoring error: {str(e)}", exc_info=True)
+                finally:
+                    if session:
+                        session.close()
+                    threading.Event().wait(30)  # Интервал между проверками
+
+        threading.Thread(target=monitor_loop, name="StockMonitor", daemon=True).start()
+
+    def stop_monitoring(self):
+        self.running = False
+        self.producer.close(timeout=5)
+        self.logger.info("Stock monitoring service stopped")
+
+
+class InvoiceProcessor:
+    def __init__(self):
+        self.consumer = KafkaConsumer(
+            Config.KAFKA_INVOICE_TOPIC,
+            bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+        )
+        self.service = LogisticsService()
+
+    def start_processing(self):
+        for message in self.consumer:
+            try:
+                data = message.value
+                if data['type'] == 'arrival':
+                    self.process_arrival(data)
+                elif data['type'] == 'departure':
+                    self.process_departure(data)
+            except Exception as e:
+                self.log_error(e)
+
+    def process_arrival(self, data):
+        items = [(item['pgd_id'], item['quantity']) for item in data['items']]
+        self.service.create_invoice_request(
+            items=items,
+            sender=data['warehouse']
+        )
+
+    def process_departure(self, data):
+        items = [(item['pgd_id'], item['quantity']) for item in data['items']]
+        self.service.create_departure_invoice(
+            items=items,
+            sender_warehouse=data['warehouse'],
+            receiver_warehouse="WHAAAAAARUS060ru00000002"  # Пример получателя
+        )
+
+    def log_error(self, error):
+        logger.error(f"Invoice processing error: {str(error)}")
 
 
 def check_delivery():

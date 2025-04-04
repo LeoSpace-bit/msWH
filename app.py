@@ -1,7 +1,10 @@
 # app.py
+import json
 import logging
 import threading
 import time
+
+from kafka import KafkaConsumer
 
 import services
 from models import StorageLocation, StockItem
@@ -39,6 +42,37 @@ def departure_invoice(logistic_service: LogisticsService):
     logistic_service.create_departure_invoice(items, Config.RECIPIENT_WAREHOUSE, reciver) # вызов функции обработчика (глубже опускаться не надо, достаточно вызывать её и передавать параметры)
 
 
+def kafka_consumer():
+    service = LogisticsService()
+    consumer = KafkaConsumer(
+        'invoice_requests',
+        bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+        value_deserializer=lambda x: json.loads(x.decode('utf-8')))
+
+    for message in consumer:
+        data = message.value
+    try:
+        if data['receiver'] != Config.RECIPIENT_WAREHOUSE:
+            print(f"Ignore invoice for {data['receiver']}")
+
+        if data['type'] == 'arrival':
+            service.create_invoice_request(
+                items=[(item['id'], item['quantity']) for item in data['items']],
+                sender=data['sender']
+            )
+        elif data['type'] == 'departure':
+            service.create_departure_invoice(
+                items=[(item['id'], item['quantity']) for item in data['items']],
+                sender_warehouse=data['sender'],
+                receiver_warehouse=data['receiver']
+            )
+        print(f"Invoice processed: {data}")
+
+    except Exception as e:
+        print(f"Error processing invoice: {str(e)}")
+
+
+
 if __name__ == '__main__':
     logging.basicConfig(
         level=logging.INFO,
@@ -52,11 +86,15 @@ if __name__ == '__main__':
     try:
         invoice_processor = services.InvoiceProcessor()
         threading.Thread(target=invoice_processor.start_processing, daemon=True).start()
+        threading.Thread(target=kafka_consumer, daemon=True).start()
 
         # Инициализация монитора
         stock_monitor = services.StockMonitor()
         stock_monitor.start_monitoring()
         logger.info("Warehouse service started")
+
+        registry = services.WarehouseRegistry()
+        registry.publish_warehouse_info()
 
         # Основной цикл
         while True:

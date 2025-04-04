@@ -502,6 +502,22 @@ class InvoiceProcessor:
         logger.error(f"Invoice processing error: {str(error)}")
 
 
+class WarehouseRegistry:
+    def __init__(self):
+        self.producer = KafkaProducer(
+            bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+
+    def publish_warehouse_info(self):
+        data = {
+            'wh_id': Config.RECIPIENT_WAREHOUSE,
+            'status': 'active',
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        self.producer.send(Config.KAFKA_WH_REGISTRY_TOPIC, data)
+
+
 def check_delivery():
     """Обработка полученных поставок и распределение товаров по ячейкам"""
     engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)
@@ -573,6 +589,7 @@ def check_delivery():
         return {"error": str(e)}
     finally:
         session.close()
+
 
 
 def _find_suitable_zone(session, pgd_id: int, required_cells: int) -> StorageLocation:

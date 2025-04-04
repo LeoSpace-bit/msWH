@@ -58,7 +58,7 @@ class LogisticsService:
         finally:
             session.close()
 
-    def create_invoice_request(self, items: list[tuple[int, int]], sender: str):
+    def create_invoice_request(self, items: list[tuple[int, int]], sender: str)  -> Invoice:
         """Создает новый инвойс с проверками"""
         if len(sender) != 24:
             raise ValueError("Sender warehouse должен быть 24 символа")
@@ -100,6 +100,7 @@ class LogisticsService:
             session.add_all(invoice_items)
             session.commit()
             print(f"Накладная [ поставка ] {new_invoice.id} создан с {len(items)} позициями")
+            return new_invoice  # Явно возвращаем объект
 
         except Exception as e:
             session.rollback()
@@ -107,6 +108,7 @@ class LogisticsService:
             raise
         finally:
             session.close()
+
 
     def satisfying_invoices(self):
         """
@@ -143,7 +145,7 @@ class LogisticsService:
 
     def create_departure_invoice(self, items: list[tuple[int, int]],
                                  sender_warehouse: str,
-                                 receiver_warehouse: str):
+                                 receiver_warehouse: str) -> Invoice:
         """
         Создание накладной на отгрузку товаров
         """
@@ -221,6 +223,7 @@ class LogisticsService:
             raise e
         finally:
             session.close()
+
 
 
 class BatchScanner:
@@ -485,18 +488,36 @@ class InvoiceProcessor:
 
     def process_arrival(self, data):
         items = [(item['pgd_id'], item['quantity']) for item in data['items']]
-        self.service.create_invoice_request(
+        # Сохраняем созданную накладную в переменную
+        invoice = self.service.create_invoice_request(
             items=items,
             sender=data['warehouse']
         )
+        self._send_update(invoice, 'arrival')  # Передаем объект invoice
 
     def process_departure(self, data):
         items = [(item['pgd_id'], item['quantity']) for item in data['items']]
-        self.service.create_departure_invoice(
+        # Сохраняем созданную накладную в переменную
+        invoice = self.service.create_departure_invoice(
             items=items,
             sender_warehouse=data['warehouse'],
-            receiver_warehouse="WHAAAAAARUS060ru00000002"  # Пример получателя
+            receiver_warehouse="WHAAAAAARUS060ru00000002"
         )
+        self._send_update(invoice, 'departure')  # Передаем объект invoice
+
+    def _send_update(self, invoice, invoice_type):
+        self.producer.send('invoice_updates', {
+            'id': invoice.id,
+            'type': invoice_type,
+            'status': invoice.status.value,
+            'sender': invoice.sender_warehouse,
+            'receiver': invoice.receiver_warehouse,
+            'items': [{
+                'id': item.pgd_id,
+                'quantity': item.quantity
+            } for item in invoice.items],
+            'timestamp': invoice.created_at.isoformat()
+        })
 
     def log_error(self, error):
         logger.error(f"Invoice processing error: {str(error)}")

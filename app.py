@@ -3,8 +3,9 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime
 
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 
 import services
 from models import StorageLocation, StockItem
@@ -47,29 +48,52 @@ def kafka_consumer():
     consumer = KafkaConsumer(
         'invoice_requests',
         bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
-        value_deserializer=lambda x: json.loads(x.decode('utf-8')))
+        value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+    )
+
+    producer = KafkaProducer(
+        bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+    )
 
     for message in consumer:
         data = message.value
-    try:
-        if data['receiver'] != Config.RECIPIENT_WAREHOUSE:
-            print(f"Ignore invoice for {data['receiver']}")
+        try:
+            invoice = None  # Объявляем переменную заранее
 
-        if data['type'] == 'arrival':
-            service.create_invoice_request(
-                items=[(item['id'], item['quantity']) for item in data['items']],
-                sender=data['sender']
-            )
-        elif data['type'] == 'departure':
-            service.create_departure_invoice(
-                items=[(item['id'], item['quantity']) for item in data['items']],
-                sender_warehouse=data['sender'],
-                receiver_warehouse=data['receiver']
-            )
-        print(f"Invoice processed: {data}")
+            if data['type'] == 'arrival':
+                # Получаем созданную накладную из метода
+                invoice = service.create_invoice_request(
+                    items=[(item['id'], item['quantity']) for item in data['items']],
+                    sender=data['sender']
+                )
+            elif data['type'] == 'departure':
+                # Получаем созданную накладную из метода
+                invoice = service.create_departure_invoice(
+                    items=[(item['id'], item['quantity']) for item in data['items']],
+                    sender_warehouse=data['sender'],
+                    receiver_warehouse=data['receiver']
+                )
 
-    except Exception as e:
-        print(f"Error processing invoice: {str(e)}")
+            # Проверяем успешное создание накладной
+            if invoice:
+                producer.send('invoice_updates', {
+                    'id': invoice.id,
+                    'type': data['type'],
+                    'status': invoice.status.value,  # Используем реальный статус
+                    'sender': data['sender'],
+                    'receiver': data['receiver'],
+                    'items': data['items'],
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+
+        except Exception as e:
+            print(f"Error processing invoice: {str(e)}")
+            producer.send('invoice_errors', {
+                'error': str(e),
+                'data': data,
+                'timestamp': datetime.utcnow().isoformat()
+            })
 
 
 

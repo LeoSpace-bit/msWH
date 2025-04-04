@@ -30,6 +30,17 @@ class Config:
         }
     }
 
+    FAKE_WAREHOUSES = {
+        'WHAAAAAARUS060ru00000001': {
+            'name': 'Основной склад',
+            'location': 'Москва'
+        },
+        'WHBBBBBBRUS060ru00000002': {
+            'name': 'Резервный склад',
+            'location': 'Санкт-Петербург'
+        }
+    }
+
     # В config.py WH добавить:
     KAFKA_BOOTSTRAP_SERVERS = 'localhost:29092'
     KAFKA_STOCK_TOPIC = 'warehouse_stock_updates'

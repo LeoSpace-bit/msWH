@@ -1,4 +1,5 @@
 #services.py
+import time
 from datetime import datetime, timedelta
 import random
 
@@ -529,14 +530,28 @@ class WarehouseRegistry:
             bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
             value_serializer=lambda v: json.dumps(v).encode('utf-8')
         )
+        self.wh_data = {
+            'WHAAAAAARUS060ru00000001': {
+                'name': 'Основной склад',
+                'location': 'Москва',
+                'capacity': '5000 м²'
+            },
+            'WHBBBBBBRUS060ru00000002': {
+                'name': 'Резервный склад',
+                'location': 'Санкт-Петербург',
+                'capacity': '3000 м²'
+            }
+        }
 
     def publish_warehouse_info(self):
-        data = {
-            'wh_id': Config.RECIPIENT_WAREHOUSE,
-            'status': 'active',
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        self.producer.send(Config.KAFKA_WH_REGISTRY_TOPIC, data)
+        for wh_id, meta in self.wh_data.items():
+            data = {
+                'wh_id': wh_id,
+                'status': 'active',
+                'metadata': meta,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            self.producer.send(Config.KAFKA_WH_REGISTRY_TOPIC, data)
 
 
 def check_delivery():

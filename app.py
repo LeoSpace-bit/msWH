@@ -118,7 +118,8 @@ if __name__ == '__main__':
         logger.info("Warehouse service started")
 
         registry = services.WarehouseRegistry()
-        registry.publish_warehouse_info()
+        # Убрать вызов publish_warehouse_info(), так как heartbeat работает автоматически
+        logger.info("Warehouse registry started")
 
         # Основной цикл
         while True:

@@ -1,6 +1,6 @@
 #services.py
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import random
 
 import logger
@@ -225,8 +225,6 @@ class LogisticsService:
         finally:
             session.close()
 
-
-
 class BatchScanner:
     """Симулятор сканера штрих-кодов"""
 
@@ -245,7 +243,6 @@ class BatchScanner:
             base.replace('B', '8')  # Замена похожих символов
         ]
         return random.choice(variants)
-
 
 class ScannersQueue:
     """Обработчик очереди сканирования для склада"""
@@ -393,7 +390,6 @@ class ScannersQueue:
             "message": f"Системная ошибка: {str(error)}"
         }
 
-
 class StockMonitor:
     def __init__(self):
         self.engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)
@@ -423,23 +419,25 @@ class StockMonitor:
                 try:
                     session = self.Session()
                     # Получаем актуальные данные из БД
-                    stock_items = session.query(StockItem).filter(StockItem.quantity > 0).all()
-                    self.logger.debug(f"Found {len(stock_items)} stock items in DB")
-
-                    if not stock_items:
-                        self.logger.warning("No stock items found in database")
-                        continue
-
-                    # Формируем сообщение
-                    stock_data = {
-                        Config.RECIPIENT_WAREHOUSE: [
-                            {
-                                "pgd_id": item.pgd_id,
-                                "quantity": item.quantity,
-                                "timestamp": datetime.utcnow().isoformat()
-                            } for item in stock_items
-                        ]
-                    }
+                    try:
+                        stock_items = session.query(StockItem).all()  # Получаем все товары
+                        stock_data = {
+                            Config.RECIPIENT_WAREHOUSE: [
+                                {
+                                    "pgd_id": str(item.pgd_id),  # Преобразование в строку
+                                    "quantity": item.quantity,
+                                    "timestamp": datetime.utcnow().isoformat()
+                                }
+                                for item in stock_items
+                                if item.quantity > 0  # Фильтрация нулевых остатков
+                            ]
+                        }
+                        self.producer.send(Config.KAFKA_STOCK_TOPIC, stock_data)
+                    except Exception as e:
+                        self.logger.error(f"Stock monitoring error: {str(e)}")
+                    finally:
+                        session.close()
+                        time.sleep(30)
 
                     # Отправляем сообщение
                     future = self.producer.send(
@@ -465,7 +463,6 @@ class StockMonitor:
         self.running = False
         self.producer.close(timeout=5)
         self.logger.info("Stock monitoring service stopped")
-
 
 class InvoiceProcessor:
     def __init__(self):
@@ -523,25 +520,23 @@ class InvoiceProcessor:
     def log_error(self, error):
         logger.error(f"Invoice processing error: {str(error)}")
 
-
+# services.py (WH)
 class WarehouseRegistry:
     def __init__(self):
         self.producer = KafkaProducer(
             bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
             value_serializer=lambda v: json.dumps(v).encode('utf-8')
         )
-        self.wh_data = {
-            'WHAAAAAARUS060ru00000001': {
-                'name': 'Основной склад',
-                'location': 'Москва',
-                'capacity': '5000 м²'
-            },
-            'WHBBBBBBRUS060ru00000002': {
-                'name': 'Резервный склад',
-                'location': 'Санкт-Петербург',
-                'capacity': '3000 м²'
-            }
-        }
+        self.wh_data = Config.FAKE_WAREHOUSES
+        self.running = True
+        self.heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
+        self.heartbeat_thread.start()
+
+    def heartbeat(self):
+        """Регулярная отправка данных каждые 30 секунд"""
+        while self.running:
+            self.publish_warehouse_info()
+            time.sleep(30)
 
     def publish_warehouse_info(self):
         for wh_id, meta in self.wh_data.items():
@@ -549,10 +544,11 @@ class WarehouseRegistry:
                 'wh_id': wh_id,
                 'status': 'active',
                 'metadata': meta,
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.now(timezone.utc).isoformat()
             }
-            self.producer.send(Config.KAFKA_WH_REGISTRY_TOPIC, data)
-
+            # Явная сериализация в JSON
+            self.producer.send(Config.KAFKA_WH_REGISTRY_TOPIC, value=data)
+            print(f"Отправлены данные склада: {wh_id}")  # Логирование #self.producer.flush()
 
 def check_delivery():
     """Обработка полученных поставок и распределение товаров по ячейкам"""
@@ -626,8 +622,6 @@ def check_delivery():
     finally:
         session.close()
 
-
-
 def _find_suitable_zone(session, pgd_id: int, required_cells: int) -> StorageLocation:
     """Находит зону с достаточным количеством свободных ячеек для товара"""
     # Проверяем существующие зоны с товаром
@@ -658,7 +652,6 @@ def _find_suitable_zone(session, pgd_id: int, required_cells: int) -> StorageLoc
 
     return None
 
-
 def _update_stock_items(session, items_to_update: dict):
     """Обновляет количество товаров в StockItem"""
     for pgd_id, quantity in items_to_update.items():
@@ -669,3 +662,96 @@ def _update_stock_items(session, items_to_update: dict):
             session.add(StockItem(pgd_id=pgd_id, quantity=quantity))
 
 
+class WarehouseOnlineHeartbeat:
+    def __init__(self):
+        self.producer = KafkaProducer(
+            bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+        self.wh_id = Config.RECIPIENT_WAREHOUSE
+        self.running = True
+        self.heartbeat_thread = threading.Thread(
+            target=self.heartbeat_loop,
+            daemon=True
+        )
+        self.heartbeat_thread.start()
+
+    def heartbeat_loop(self):
+        while self.running:
+            try:
+                # Добавляем корректный timestamp
+                message = {
+                    'wh_id': self.wh_id,
+                    'timestamp': datetime.utcnow().isoformat() + 'Z'  # ISO 8601 с часовым поясом
+                }
+                self.producer.send(
+                    Config.KAFKA_WAREHOUSES_ONLINE_TOPIC,
+                    value=message
+                )
+                self.producer.flush()
+                time.sleep(5)
+            except Exception as e:
+                logging.error(f"Heartbeat error: {str(e)}")
+                time.sleep(1)
+
+    def stop(self):
+        self.running = False
+        self.producer.close()
+
+
+class GoodsRequestHandler:
+    """Обработчик запросов товаров со склада"""
+
+    def __init__(self):
+        self.engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)
+        self.Session = sessionmaker(bind=self.engine)
+        self.wh_id = Config.RECIPIENT_WAREHOUSE
+
+        self.consumer = KafkaConsumer(
+            Config.KAFKA_GOODS_REQUEST_TOPIC,
+            bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+            group_id='wh-goods-request-handler'
+        )
+
+        self.producer = KafkaProducer(
+            bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+
+        self.handler_thread = threading.Thread(
+            target=self.process_requests,
+            daemon=True
+        )
+        self.handler_thread.start()
+
+    def process_requests(self):
+        for message in self.consumer:
+            try:
+                data = message.value
+                if data.get('wh_id') != self.wh_id:
+                    continue
+
+                if data.get('command') == 'get_all_goods':
+                    goods = self.get_available_goods()
+                    self.producer.send(
+                        Config.KAFKA_GOODS_RESPONSE_TOPIC,
+                        {
+                            'wh_id': self.wh_id,
+                            'goods': goods
+                        }
+                    )
+            except Exception as e:
+                logging.error(f"Goods request error: {str(e)}")
+
+    def get_available_goods(self):
+        """Получает список доступных товаров из БД"""
+        session = self.Session()
+        try:
+            items = session.query(StockItem.pgd_id).filter(
+                StockItem.pgd_id != Config.EMPTY_STOCK_ITEM_ID,
+                StockItem.quantity > 0
+            ).all()
+            return [item.pgd_id for item in items]
+        finally:
+            session.close()

@@ -117,9 +117,15 @@ if __name__ == '__main__':
         stock_monitor.start_monitoring()
         logger.info("Warehouse service started")
 
-        registry = services.WarehouseRegistry()
+        # registry = services.WarehouseRegistry()
+        # logger.info("Warehouse registry started")
         # Убрать вызов publish_warehouse_info(), так как heartbeat работает автоматически
-        logger.info("Warehouse registry started")
+
+        warehouse_heartbeat = services.WarehouseOnlineHeartbeat()
+        goods_handler = services.GoodsRequestHandler()
+
+        # ... остальная инициализация
+        logger.info("Warehouse service started")
 
         # Основной цикл
         while True:

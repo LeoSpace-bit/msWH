@@ -729,11 +729,13 @@ class GoodsRequestHandler:
         for message in self.consumer:
             try:
                 data = message.value
+                print(f'< ><> < > <>< > DEBUG SUKA [ data.get(wh_id) ] = {data.get('wh_id')}')
                 if data.get('wh_id') != self.wh_id:
                     continue
 
                 if data.get('command') == 'get_all_goods':
                     goods = self.get_available_goods()
+                    print(f'< ><> < > <>< > DEBUG SUKA [ self.get_available_goods() ] = {goods}')
                     self.producer.send(
                         Config.KAFKA_GOODS_RESPONSE_TOPIC,
                         {
@@ -745,13 +747,26 @@ class GoodsRequestHandler:
                 logging.error(f"Goods request error: {str(e)}")
 
     def get_available_goods(self):
-        """Получает список доступных товаров из БД"""
+        """Получает список доступных товаров с количеством из БД"""
         session = self.Session()
         try:
-            items = session.query(StockItem.pgd_id).filter(
+            items = session.query(StockItem.pgd_id, StockItem.quantity).filter(
                 StockItem.pgd_id != Config.EMPTY_STOCK_ITEM_ID,
                 StockItem.quantity > 0
             ).all()
-            return [item.pgd_id for item in items]
+            # Возвращаем список словарей для явного указания полей
+            return [{'pgd_id': item.pgd_id, 'quantity': item.quantity} for item in items]
         finally:
             session.close()
+
+    # def get_available_goods(self):
+    #     """Получает список доступных товаров из БД"""
+    #     session = self.Session()
+    #     try:
+    #         items = session.query(StockItem.pgd_id).filter(
+    #             StockItem.pgd_id != Config.EMPTY_STOCK_ITEM_ID,
+    #             StockItem.quantity > 0
+    #         ).all()
+    #         return [item.pgd_id for item in items]
+    #     finally:
+    #         session.close()

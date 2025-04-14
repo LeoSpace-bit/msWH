@@ -123,6 +123,8 @@ if __name__ == '__main__':
         warehouse_heartbeat = services.WarehouseOnlineHeartbeat()
         goods_handler = services.GoodsRequestHandler()
 
+        warehouse_state_invoice = services.WarehouseStateInvoice()
+
         # ... остальная инициализация
         logger.info("Warehouse service started")
 

@@ -13,7 +13,7 @@ import logging
 
 from models import Invoice, InvoiceItem, StorageLocation, StockItem, StockAllocation
 from config import Config
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, joinedload
 from sqlalchemy import create_engine
 import uuid
 from models import InvoiceType, InvoiceStatus
@@ -770,3 +770,79 @@ class GoodsRequestHandler:
     #         return [item.pgd_id for item in items]
     #     finally:
     #         session.close()
+
+
+class WarehouseStateInvoice:
+    def __init__(self):
+        self.producer = KafkaProducer(
+            bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+        self.wh_id = Config.RECIPIENT_WAREHOUSE
+        self.engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)
+        self.Session = sessionmaker(bind=self.engine)
+        self.running = True
+        self.heartbeat_thread = threading.Thread(
+            target=self.state_invoice_loop,
+            daemon=True
+        )
+        self.heartbeat_thread.start()
+
+    def state_invoice_loop(self):
+        while self.running:
+            try:
+                # Добавляем корректный timestamp
+                invoices = self.get_available_state_invoice()
+                print(f'< ><> < > <>< > DEBUG SUKA [ self.get_available_state_invoice() ] = {invoices}')
+                message = {
+                    'wh_id': self.wh_id,
+                    'invoices': invoices,
+                    'timestamp': datetime.utcnow().isoformat() + 'Z'  # ISO 8601 с часовым поясом
+                }
+                self.producer.send(
+                    Config.KAFKA_STATE_INVOICE_TOPIC,
+                    value=message
+                )
+                self.producer.flush()
+                time.sleep(15)
+            except Exception as e:
+                logging.error(f"Invoice loop error: {str(e)}")
+                time.sleep(1)
+
+    def get_available_state_invoice(self):
+        session = self.Session()
+        try:
+            # Загружаем все накладные вместе с их товарами за один запрос
+            invoices = session.query(Invoice).options(joinedload(Invoice.items)).all()
+
+            result = []
+            for invoice in invoices:
+                # Формируем структуру для накладной
+                invoice_data = {
+                    "invoice_id": invoice.id,
+                    "invoice_type": invoice.invoice_type.value,
+                    "status": invoice.status.value,
+                    "created_at": invoice.created_at.isoformat(),
+                    "sender_warehouse": invoice.sender_warehouse,
+                    "receiver_warehouse": invoice.receiver_warehouse,
+                    "items": []
+                }
+
+                # Добавляем информацию о товарах накладной
+                for item in invoice.items:
+                    item_data = {
+                        "pgd_id": item.pgd_id,
+                        "quantity": item.quantity,
+                        "batch_number": item.batch_number,
+                    }
+                    invoice_data["items"].append(item_data)
+
+                result.append(invoice_data)
+
+            return result
+        finally:
+            session.close()
+
+    def stop(self):
+        self.running = False
+        self.producer.close()

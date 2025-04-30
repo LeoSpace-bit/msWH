@@ -11,6 +11,7 @@ class Config:
     KAFKA_BOOTSTRAP_SERVERS = 'localhost:29092'
     KAFKA_STOCK_TOPIC = 'warehouse_stock_updates'
     KAFKA_INVOICE_TOPIC = 'invoice_requests'
+    KAFKA_LOGISTIC_INVOICE_TOPIC = 'logistics_invoices'
     KAFKA_WH_REGISTRY_TOPIC = 'warehouse_registry'
     KAFKA_WAREHOUSES_ONLINE_TOPIC = 'warehouses_online'
     KAFKA_GOODS_REQUEST_TOPIC = 'warehouse_goods_request'

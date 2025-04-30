@@ -2,6 +2,7 @@
 import time
 from datetime import datetime, timedelta, timezone
 import random
+from time import sleep
 
 import logger
 from kafka.errors import NoBrokersAvailable
@@ -698,21 +699,14 @@ class WarehouseOnlineHeartbeat:
         self.running = False
         self.producer.close()
 
-
 class GoodsRequestHandler:
     """Обработчик запросов товаров со склада"""
 
     def __init__(self):
         self.engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)
+        self.lock = threading.Lock()
         self.Session = sessionmaker(bind=self.engine)
         self.wh_id = Config.RECIPIENT_WAREHOUSE
-
-        self.consumer = KafkaConsumer(
-            Config.KAFKA_GOODS_REQUEST_TOPIC,
-            bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
-            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-            group_id='wh-goods-request-handler'
-        )
 
         self.producer = KafkaProducer(
             bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
@@ -726,25 +720,23 @@ class GoodsRequestHandler:
         self.handler_thread.start()
 
     def process_requests(self):
-        for message in self.consumer:
+        while True:  # Бесконечный цикл
             try:
-                data = message.value
-                print(f'< ><> < > <>< > DEBUG SUKA [ data.get(wh_id) ] = {data.get('wh_id')}')
-                if data.get('wh_id') != self.wh_id:
-                    continue
+                goods = self.get_available_goods()
+                print(f'DEBUG: Sending goods data: {goods}')
+                self.producer.send(
+                    Config.KAFKA_GOODS_RESPONSE_TOPIC,
+                    {
+                        'wh_id': self.wh_id,
+                        'goods': goods
+                    }
+                )
+                self.producer.flush()
 
-                if data.get('command') == 'get_all_goods':
-                    goods = self.get_available_goods()
-                    print(f'< ><> < > <>< > DEBUG SUKA [ self.get_available_goods() ] = {goods}')
-                    self.producer.send(
-                        Config.KAFKA_GOODS_RESPONSE_TOPIC,
-                        {
-                            'wh_id': self.wh_id,
-                            'goods': goods
-                        }
-                    )
             except Exception as e:
                 logging.error(f"Goods request error: {str(e)}")
+
+            time.sleep(5)
 
     def get_available_goods(self):
         """Получает список доступных товаров с количеством из БД"""
@@ -758,19 +750,6 @@ class GoodsRequestHandler:
             return [{'pgd_id': item.pgd_id, 'quantity': item.quantity} for item in items]
         finally:
             session.close()
-
-    # def get_available_goods(self):
-    #     """Получает список доступных товаров из БД"""
-    #     session = self.Session()
-    #     try:
-    #         items = session.query(StockItem.pgd_id).filter(
-    #             StockItem.pgd_id != Config.EMPTY_STOCK_ITEM_ID,
-    #             StockItem.quantity > 0
-    #         ).all()
-    #         return [item.pgd_id for item in items]
-    #     finally:
-    #         session.close()
-
 
 class WarehouseStateInvoice:
     def __init__(self):
@@ -846,3 +825,110 @@ class WarehouseStateInvoice:
     def stop(self):
         self.running = False
         self.producer.close()
+
+#Получение заявок
+class WarehouseAcceptInvoice:
+    def __init__(self):
+        self.own_id = Config.RECIPIENT_WAREHOUSE
+        self.invoice_received = []
+        self.consumer = KafkaConsumer(
+            Config.KAFKA_LOGISTIC_INVOICE_TOPIC,
+            bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
+            auto_offset_reset='earliest',
+            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+            group_id='wh-consumer-wai-v1',
+            enable_auto_commit=False,
+            session_timeout_ms=60000,
+            max_poll_interval_ms=300000,
+            # consumer_timeout_ms=-1 # Слушаем постоянно
+        )
+        self.running = True
+        self.lock = threading.Lock()
+        self.heartbeat_thread = threading.Thread(
+            target=self.state_invoice_loop,
+            daemon=True
+        )
+        self.heartbeat_thread.start()
+
+    def state_invoice_loop(self):
+        while self.running:
+            for message in self.consumer:
+                try:
+                    data = message.value
+
+                    if not data:
+                        self.consumer.commit()
+                        continue
+
+
+                    sender_wh = data.get('sender_warehouse')
+                    receiver_wh = data.get('receiver_warehouse')
+
+                    if sender_wh != Config.RECIPIENT_WAREHOUSE and receiver_wh != Config.RECIPIENT_WAREHOUSE:
+                        print(f"GRH Message skipped: neither sender nor receiver is {Config.RECIPIENT_WAREHOUSE}")
+                        self.consumer.commit()
+                        continue
+
+                    invoice_tag = data.get('tag')
+                    invoice_type = data.get('invoice_type')
+                    timestamp = data.get('timestamp')
+
+                    items_msg = data.get('items')
+
+                    if not items_msg:
+                        self.consumer.commit()
+                        continue
+
+                    valid_goods = []
+                    for item in items_msg:
+                        # Проверяем, что item это словарь и содержит нужные ключи
+                        if isinstance(item, dict) and 'pgd_id' in item and 'quantity' in item:
+                            try:
+                                # Приводим к нужным типам и добавляем
+                                valid_goods.append({
+                                    'pgd_id': str(item['pgd_id']),
+                                    'quantity': int(item['quantity'])
+                                })
+                            except (ValueError, TypeError) as e:
+                                print(f"GRH invalid data types in goods item for {self.own_id}: {item}. Error: {e}")
+                        else:
+                            print(f"GRH invalid goods item structure for {self.own_id}: {item}")
+
+                    print(f'@ debug | Invoice tag: {invoice_tag}')
+                    print(f'@ debug | Invoice Type: {invoice_type}')
+                    print(f'@ debug | Sender Warehouse: {sender_wh}')
+                    print(f'@ debug | Receiver Warehouse: {receiver_wh}')
+                    print(f'@ debug | Timestamp: {timestamp}')
+                    print(f'@ debug | Valid Goods: {valid_goods}')
+
+
+                    #лог полученного сообщения:
+                    # @ debug | Invoice tag: 3b6d48a2-5e5a-4f3d-8b7c-1c1d1e1f2021
+                    # @ debug | Invoice Type: arrival
+                    # @ debug | Sender Warehouse: any
+                    # @ debug | Receiver Warehouse: WHAAAAAARUS060ru00000002
+                    # @ debug | Timestamp: 2025-04-25T17:27:46.404790+00:00
+                    # @ debug | Valid Goods: [{'pgd_id': '9', 'quantity': 51}, {'pgd_id': '13', 'quantity': 13}, {'pgd_id': '16', 'quantity': 18}]
+
+                    self.invoice_received.append({
+                        'invoice_tag': invoice_tag,
+                        'invoice_type': invoice_type,
+                        'sender_wh': sender_wh,
+                        'receiver_wh': receiver_wh,
+                        'timestamp': timestamp,
+                        'valid_goods': valid_goods  # Список товаров
+                    })
+                    self.consumer.commit()
+
+                except Exception as e:
+                    print(f"Goods response error: {str(e)}")
+                    print(f"Problematic message: {message.value}")
+                    try:
+                        self.consumer.commit()
+                    except Exception as commit_err:
+                        print(f"GRH failed to commit offset after error: {commit_err}")
+        sleep(1)
+
+    def stop(self):
+        self.running = False
+        self.consumer.close()

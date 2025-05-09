@@ -2,7 +2,6 @@
 import time
 from datetime import datetime, timedelta, timezone
 import random
-from time import sleep
 
 import logger
 from kafka.errors import NoBrokersAvailable
@@ -19,7 +18,6 @@ from sqlalchemy import create_engine
 import uuid
 from models import InvoiceType, InvoiceStatus
 from collections import defaultdict
-
 
 class LogisticsService:
     def __init__(self):
@@ -115,6 +113,8 @@ class LogisticsService:
     def satisfying_invoices(self):
         """
         Обновляет статус счетов с типом ARRIVAL и статусом CREATED на SHIPPING.
+        Код для отработки сценария. Данным действием должен заниматься склад отправитель
+        заявки со статусом departure
 
         Args:
             session (Session): Сессия SQLAlchemy для работы с базой данных.
@@ -230,8 +230,8 @@ class BatchScanner:
     """Симулятор сканера штрих-кодов"""
 
     def simulate_scan(self, expected_batch: str) -> str:
-        """Имитирует процесс сканирования с 15% вероятностью ошибки"""
-        if random.random() < 0.1:
+        """Имитирует процесс сканирования с 0% вероятностью ошибки"""
+        if random.random() < 0:
             return self._generate_incorrect_batch(expected_batch)
         return expected_batch
 
@@ -772,7 +772,7 @@ class WarehouseStateInvoice:
             try:
                 # Добавляем корректный timestamp
                 invoices = self.get_available_state_invoice()
-                print(f'< ><> < > <>< > DEBUG SUKA [ self.get_available_state_invoice() ] = {invoices}')
+                print(f'< ><> < > <>< > DEBUG Bubbles [ self.get_available_state_invoice() ] = {invoices}')
                 message = {
                     'wh_id': self.wh_id,
                     'invoices': invoices,
@@ -829,14 +829,15 @@ class WarehouseStateInvoice:
 #Получение заявок
 class WarehouseAcceptInvoice:
     def __init__(self):
+        self.logger = logging.getLogger('WarehouseAcceptInvoice')
         self.own_id = Config.RECIPIENT_WAREHOUSE
-        self.invoice_received = []
+        self.logistics_service = LogisticsService()
         self.consumer = KafkaConsumer(
             Config.KAFKA_LOGISTIC_INVOICE_TOPIC,
             bootstrap_servers=Config.KAFKA_BOOTSTRAP_SERVERS,
             auto_offset_reset='earliest',
             value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-            group_id='wh-consumer-wai-v1',
+            group_id=f'wh-consumer-wai-{self.own_id}-v2',
             enable_auto_commit=False,
             session_timeout_ms=60000,
             max_poll_interval_ms=300000,
@@ -844,91 +845,134 @@ class WarehouseAcceptInvoice:
         )
         self.running = True
         self.lock = threading.Lock()
-        self.heartbeat_thread = threading.Thread(
-            target=self.state_invoice_loop,
+        self.processing_thread = threading.Thread(
+            target=self.process_incoming_invoices,
             daemon=True
         )
-        self.heartbeat_thread.start()
+        self.processing_thread.start()
 
-    def state_invoice_loop(self):
+    def process_incoming_invoices(self):
         while self.running:
-            for message in self.consumer:
-                try:
-                    data = message.value
-
-                    if not data:
-                        self.consumer.commit()
-                        continue
-
-
-                    sender_wh = data.get('sender_warehouse')
-                    receiver_wh = data.get('receiver_warehouse')
-
-                    if sender_wh != Config.RECIPIENT_WAREHOUSE and receiver_wh != Config.RECIPIENT_WAREHOUSE:
-                        print(f"GRH Message skipped: neither sender nor receiver is {Config.RECIPIENT_WAREHOUSE}")
-                        self.consumer.commit()
-                        continue
-
-                    invoice_tag = data.get('tag')
-                    invoice_type = data.get('invoice_type')
-                    timestamp = data.get('timestamp')
-
-                    items_msg = data.get('items')
-
-                    if not items_msg:
-                        self.consumer.commit()
-                        continue
-
-                    valid_goods = []
-                    for item in items_msg:
-                        # Проверяем, что item это словарь и содержит нужные ключи
-                        if isinstance(item, dict) and 'pgd_id' in item and 'quantity' in item:
-                            try:
-                                # Приводим к нужным типам и добавляем
-                                valid_goods.append({
-                                    'pgd_id': str(item['pgd_id']),
-                                    'quantity': int(item['quantity'])
-                                })
-                            except (ValueError, TypeError) as e:
-                                print(f"GRH invalid data types in goods item for {self.own_id}: {item}. Error: {e}")
-                        else:
-                            print(f"GRH invalid goods item structure for {self.own_id}: {item}")
-
-                    print(f'@ debug | Invoice tag: {invoice_tag}')
-                    print(f'@ debug | Invoice Type: {invoice_type}')
-                    print(f'@ debug | Sender Warehouse: {sender_wh}')
-                    print(f'@ debug | Receiver Warehouse: {receiver_wh}')
-                    print(f'@ debug | Timestamp: {timestamp}')
-                    print(f'@ debug | Valid Goods: {valid_goods}')
-
-
-                    #лог полученного сообщения:
-                    # @ debug | Invoice tag: 3b6d48a2-5e5a-4f3d-8b7c-1c1d1e1f2021
-                    # @ debug | Invoice Type: arrival
-                    # @ debug | Sender Warehouse: any
-                    # @ debug | Receiver Warehouse: WHAAAAAARUS060ru00000002
-                    # @ debug | Timestamp: 2025-04-25T17:27:46.404790+00:00
-                    # @ debug | Valid Goods: [{'pgd_id': '9', 'quantity': 51}, {'pgd_id': '13', 'quantity': 13}, {'pgd_id': '16', 'quantity': 18}]
-
-                    self.invoice_received.append({
-                        'invoice_tag': invoice_tag,
-                        'invoice_type': invoice_type,
-                        'sender_wh': sender_wh,
-                        'receiver_wh': receiver_wh,
-                        'timestamp': timestamp,
-                        'valid_goods': valid_goods  # Список товаров
-                    })
-                    self.consumer.commit()
-
-                except Exception as e:
-                    print(f"Goods response error: {str(e)}")
-                    print(f"Problematic message: {message.value}")
+            try:
+                for message in self.consumer:
                     try:
+                        data = message.value
+                        self.logger.debug(f"Received message: {data}")
+
+                        if not data:
+                            self.logger.warning("Received empty message.")
+                            self.consumer.commit() # Подтверждаем пустое сообщение
+                            continue
+
+                        sender_wh = data.get('sender_warehouse')
+                        receiver_wh = data.get('receiver_warehouse')
+                        invoice_type = data.get('invoice_type') # 'arrival' или 'departure'
+                        items_msg = data.get('items')
+                        invoice_tag = data.get('tag', 'N/A') # Получаем тэг для логирования
+                        timestamp = data.get('timestamp', 'N/A') # Получаем timestamp для логирования
+
+                        # Пропускаем сообщение, если оно не относится к нашему складу
+                        if sender_wh != self.own_id and receiver_wh != self.own_id:
+                            self.logger.debug(f"Message skipped: neither sender '{sender_wh}' nor receiver '{receiver_wh}' is {self.own_id}. Tag: {invoice_tag}")
+                            self.consumer.commit()
+                            continue
+
+                        # Валидация товаров
+                        if not items_msg or not isinstance(items_msg, list):
+                            self.logger.warning(f"Invalid or missing 'items' in message. Tag: {invoice_tag}, Data: {data}")
+                            self.consumer.commit()
+                            continue
+
+                        valid_goods = []
+                        valid = True
+                        for item in items_msg:
+                            if isinstance(item, dict) and 'pgd_id' in item and 'quantity' in item:
+                                try:
+                                    pgd_id_int = int(item['pgd_id'])
+                                    quantity_int = int(item['quantity'])
+                                    if quantity_int <= 0:
+                                         self.logger.warning(f"Invalid quantity ({quantity_int}) for pgd_id {pgd_id_int}. Must be positive. Tag: {invoice_tag}")
+                                         valid = False
+                                         break
+                                    valid_goods.append((pgd_id_int, quantity_int)) # Используем кортеж (int, int) как в LogisticsService
+                                except (ValueError, TypeError) as e:
+                                    self.logger.warning(f"Invalid data types in goods item: {item}. Error: {e}. Tag: {invoice_tag}")
+                                    valid = False
+                                    break
+                            else:
+                                self.logger.warning(f"Invalid goods item structure: {item}. Tag: {invoice_tag}")
+                                valid = False
+                                break
+
+                        if not valid:
+                            self.consumer.commit()
+                            continue
+
+                        self.logger.info(f"Processing invoice. Tag: {invoice_tag}, Type: {invoice_type}, Sender: {sender_wh}, Receiver: {receiver_wh}, Items: {valid_goods}")
+
+
+                        invoice_created = None
+                        try:
+                            if invoice_type == 'arrival' and receiver_wh == self.own_id:
+                                self.logger.info(f"Creating ARRIVAL invoice from sender {sender_wh} (will be 'WHAAAAAARUS060ru01100001'). Tag: {invoice_tag}")
+                                invoice_created = self.logistics_service.create_invoice_request(
+                                    items=valid_goods,
+                                    sender="WHAAAAAARUS060ru01100001"
+                                )
+                                self.logger.info(f"Successfully created ARRIVAL invoice ID: {invoice_created.id}. Tag: {invoice_tag}")
+
+                            elif invoice_type == 'departure' and sender_wh == self.own_id:
+                                self.logger.info(f"Creating DEPARTURE invoice to receiver {receiver_wh} (will be 'WHAAAAAARUS060ru01100001'). Tag: {invoice_tag}")
+                                invoice_created = self.logistics_service.create_departure_invoice(
+                                    items=valid_goods,
+                                    sender_warehouse=self.own_id,
+                                    receiver_warehouse="WHAAAAAARUS060ru01100001"
+                                )
+                                self.logger.info(f"Successfully created DEPARTURE invoice ID: {invoice_created.id} with status {invoice_created.status}. Tag: {invoice_tag}")
+
+                            else:
+                                # Случай, когда тип не arrival/departure или sender/receiver не совпали с типом
+                                self.logger.warning(f"Message processing skipped: Mismatched type/warehouse. Type: {invoice_type}, Sender: {sender_wh}, Receiver: {receiver_wh}, OwnID: {self.own_id}. Tag: {invoice_tag}")
+
+                        except ValueError as ve: # Ловим ошибки валидации из LogisticsService
+                            self.logger.error(f"Failed to create invoice due to validation error: {ve}. Tag: {invoice_tag}, Data: {data}")
+                        except SQLAlchemyError as dbe: # Ловим ошибки БД
+                            self.logger.error(f"Failed to create invoice due to database error: {dbe}. Tag: {invoice_tag}, Data: {data}")
+                        except Exception as e: # Ловим прочие ошибки при создании накладной
+                             self.logger.error(f"An unexpected error occurred during invoice creation: {e}. Tag: {invoice_tag}, Data: {data}", exc_info=True)
+
+                        # Подтверждаем сообщение Kafka *после* попытки обработки
                         self.consumer.commit()
-                    except Exception as commit_err:
-                        print(f"GRH failed to commit offset after error: {commit_err}")
-        sleep(1)
+
+                    except json.JSONDecodeError as jde:
+                        self.logger.error(f"Failed to decode JSON message: {message.value}. Error: {jde}")
+                        # Не можем обработать - подтверждаем, чтобы не застрять
+                        try:
+                            self.consumer.commit()
+                        except Exception as commit_err:
+                            self.logger.error(f"Failed to commit offset after JSON decode error: {commit_err}")
+                    except Exception as msg_proc_err:
+                        self.logger.error(f"Error processing message: {msg_proc_err}", exc_info=True)
+                        # Неизвестная ошибка при обработке сообщения, пытаемся подтвердить
+                        try:
+                            self.consumer.commit()
+                        except Exception as commit_err:
+                             self.logger.error(f"Failed to commit offset after message processing error: {commit_err}")
+            except NoBrokersAvailable as e:
+                 self.logger.error(f"Kafka brokers not available in processing loop: {e}. Retrying connection...")
+                 time.sleep(10) # Пауза перед попыткой переподключения
+            except Exception as loop_err:
+                self.logger.error(f"Critical error in Kafka consumer loop: {loop_err}", exc_info=True)
+                time.sleep(5) # Небольшая пауза перед следующей итерацией в случае критической ошибки
+
+        self.logger.info("Invoice processing loop stopped.")
 
     def stop(self):
+        self.logger.info("Stopping WarehouseAcceptInvoice service...")
         self.running = False
-        self.consumer.close()
+        if self.consumer: # Проверяем, что consumer был создан
+            self.consumer.close()
+        # Ожидаем завершения потока обработки, если он запущен
+        if hasattr(self, 'processing_thread') and self.processing_thread.is_alive():
+             self.processing_thread.join(timeout=5) # Даем потоку время на завершение
+        self.logger.info("WarehouseAcceptInvoice service stopped.")
